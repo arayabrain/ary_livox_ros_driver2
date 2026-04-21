@@ -1,4 +1,23 @@
-# judge which cmake codes to use 
+# Auto-detect ROS edition and distro from the environment when not passed
+# explicitly via -DROS_EDITION/-DDISTRO_ROS. This lets a plain `colcon build`
+# at the workspace root work without going through build.sh.
+if(NOT DEFINED ROS_EDITION OR ROS_EDITION STREQUAL "")
+  if(DEFINED ENV{ROS_VERSION} AND "$ENV{ROS_VERSION}" STREQUAL "1")
+    set(ROS_EDITION "ROS1")
+  else()
+    set(ROS_EDITION "ROS2")
+  endif()
+endif()
+
+if(NOT DEFINED DISTRO_ROS OR DISTRO_ROS STREQUAL "")
+  if(DEFINED ENV{ROS_DISTRO})
+    set(DISTRO_ROS "$ENV{ROS_DISTRO}")
+  endif()
+endif()
+
+message(STATUS "livox_ros_driver2: ROS_EDITION=${ROS_EDITION} DISTRO_ROS=${DISTRO_ROS}")
+
+# judge which cmake codes to use
 if(ROS_EDITION STREQUAL "ROS1")
 
   # Copyright(c) 2019 livoxtech limited.
@@ -328,9 +347,13 @@ else(ROS_EDITION STREQUAL "ROS2")
     ament_lint_auto_find_test_dependencies()
   endif()
 
+  # Install launch_ROS2/ as share/${PROJECT_NAME}/launch so downstream code
+  # can call `ros2 launch livox_ros_driver2 <file>` the same way build.sh did.
+  install(DIRECTORY launch_ROS2/
+    DESTINATION share/${PROJECT_NAME}/launch
+  )
   ament_auto_package(INSTALL_TO_SHARE
     config
-    launch_ROS2
   )
 
 endif()
