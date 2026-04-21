@@ -267,6 +267,8 @@ typedef struct {
   ExtParameter extrinsic_param;
   volatile uint32_t set_bits;
   volatile uint32_t get_bits;
+  std::string topic_name;  // from JSON "name"; drives /livox/<topic_name>/points
+  std::string frame_id;    // from JSON "frame_id"; overrides global frame_id when non-empty
 } UserLivoxLidarConfig;
 
 /** Lidar data source info abstract */

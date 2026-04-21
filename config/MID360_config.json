@@ -26,6 +26,8 @@
   "lidar_configs" : [
     {
       "ip" : "192.168.1.12",
+      "name" : "center",
+      "frame_id" : "center_livox_mid_360",
       "pcl_data_type" : 1,
       "pattern_mode" : 0,
       "extrinsic_parameter" : {
