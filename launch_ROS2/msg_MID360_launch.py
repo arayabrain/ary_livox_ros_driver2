@@ -19,6 +19,8 @@ cur_config_path = cur_path + '../config'
 user_config_path = os.path.join(cur_config_path, 'MID360_config.json')
 ################### user configure parameters for ros2 end #####################
 
+sleep_on_shutdown = True  # set False to keep the LiDAR spinning after the node exits
+
 livox_ros2_params = [
     {"xfer_format": xfer_format},
     {"multi_topic": multi_topic},
@@ -28,7 +30,8 @@ livox_ros2_params = [
     {"frame_id": frame_id},
     {"lvx_file_path": lvx_file_path},
     {"user_config_path": user_config_path},
-    {"cmdline_input_bd_code": cmdline_bd_code}
+    {"cmdline_input_bd_code": cmdline_bd_code},
+    {"sleep_on_shutdown": sleep_on_shutdown}
 ]
 
 

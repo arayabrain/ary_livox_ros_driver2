@@ -23,7 +23,11 @@
 //
 
 #include "driver_node.h"
+
+#include <chrono>
+
 #include "lddc.h"
+#include "lds_lidar.h"
 
 namespace livox_ros {
 
@@ -32,10 +36,15 @@ DriverNode& DriverNode::GetNode() noexcept {
 }
 
 DriverNode::~DriverNode() {
+  if (sleep_on_shutdown_ && lddc_ptr_ && lddc_ptr_->lds_) {
+    static_cast<LdsLidar*>(lddc_ptr_->lds_)->SleepAllLidarsBlocking(
+        std::chrono::milliseconds(2000));
+  }
   lddc_ptr_->lds_->RequestExit();
   exit_signal_.set_value();
   pointclouddata_poll_thread_->join();
   imudata_poll_thread_->join();
+  lddc_ptr_->lds_->PrepareExit();
 }
 
 } // namespace livox_ros

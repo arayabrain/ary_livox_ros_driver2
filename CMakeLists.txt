@@ -336,6 +336,13 @@ else(ROS_EDITION STREQUAL "ROS2")
     EXECUTABLE ${PROJECT_NAME}_node
   )
 
+  # CLI tool for setting LiDAR work mode outside the driver lifecycle.
+  #   ros2 run livox_ros_driver2 livox_set_mode <config.json> <sleep|normal>
+  add_executable(livox_set_mode src/tools/livox_set_mode.cpp)
+  target_include_directories(livox_set_mode PRIVATE ${LIVOX_LIDAR_SDK_INCLUDE_DIR})
+  target_link_libraries(livox_set_mode ${LIVOX_LIDAR_SDK_LIBRARY})
+  install(TARGETS livox_set_mode DESTINATION lib/${PROJECT_NAME})
+
   if(BUILD_TESTING)
     find_package(ament_lint_auto REQUIRED)
     # the following line skips the linter which checks for copyrights

@@ -27,6 +27,7 @@
 #ifndef LIVOX_ROS_DRIVER_LDS_LIDAR_H_
 #define LIVOX_ROS_DRIVER_LDS_LIDAR_H_
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -52,6 +53,15 @@ class LdsLidar final : public Lds {
   bool Start();
 
   int DeInitLdsLidar(void);
+
+  /**
+   * Send kLivoxLidarWakeUp (MID-360 low-power standby) to every connected
+   * LiDAR and block until all acknowledge, or the timeout elapses. Safe to
+   * call from the driver node destructor: it does not retry and always
+   * returns within `timeout`. NOTE: despite the enum name, kLivoxLidarWakeUp
+   * is the correct "sleep / motor off" mode on MID-360 — see Livox-SDK2#103.
+   */
+  void SleepAllLidarsBlocking(std::chrono::milliseconds timeout);
  private:
   LdsLidar(double publish_freq);
   LdsLidar(const LdsLidar &) = delete;

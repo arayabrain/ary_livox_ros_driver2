@@ -26,6 +26,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -210,5 +212,66 @@ int LdsLidar::DeInitLdsLidar(void) {
 }
 
 void LdsLidar::PrepareExit(void) { DeInitLdsLidar(); }
+
+namespace {
+
+struct SleepAckState {
+  std::mutex mu;
+  std::condition_variable cv;
+  uint32_t pending = 0;
+};
+
+void SleepAckCallback(livox_status status, uint32_t handle,
+                      LivoxLidarAsyncControlResponse* /*response*/,
+                      void* client_data) {
+  auto* state = static_cast<SleepAckState*>(client_data);
+  if (state == nullptr) return;
+  if (status != kLivoxLidarStatusSuccess) {
+    std::cout << "sleep command failed, handle: " << handle
+              << ", status: " << status << std::endl;
+  } else {
+    std::cout << "sleep acknowledged, handle: " << handle << std::endl;
+  }
+  {
+    std::lock_guard<std::mutex> lock(state->mu);
+    if (state->pending > 0) {
+      --state->pending;
+    }
+  }
+  state->cv.notify_all();
+}
+
+}  // namespace
+
+void LdsLidar::SleepAllLidarsBlocking(std::chrono::milliseconds timeout) {
+  if (!is_initialized_) {
+    return;
+  }
+
+  SleepAckState state;
+  std::vector<uint32_t> handles;
+  for (uint8_t i = 0; i < kMaxSourceLidar; ++i) {
+    if (lidars_[i].handle != 0 && lidars_[i].lidar_type == kLivoxLidarType) {
+      handles.push_back(lidars_[i].handle);
+    }
+  }
+
+  if (handles.empty()) {
+    return;
+  }
+
+  state.pending = static_cast<uint32_t>(handles.size());
+  for (uint32_t handle : handles) {
+    std::cout << "sending sleep command to handle: " << handle << std::endl;
+    SetLivoxLidarWorkMode(handle, kLivoxLidarWakeUp, SleepAckCallback, &state);
+  }
+
+  std::unique_lock<std::mutex> lock(state.mu);
+  if (!state.cv.wait_for(lock, timeout, [&state] { return state.pending == 0; })) {
+    std::cout << "sleep timeout: " << state.pending
+              << " LiDAR(s) did not acknowledge within "
+              << timeout.count() << " ms" << std::endl;
+  }
+}
 
 }  // namespace livox_ros

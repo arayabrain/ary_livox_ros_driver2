@@ -61,6 +61,8 @@ class DriverNode final : public rclcpp::Node {
 
   DriverNode& GetNode() noexcept;
 
+  bool sleep_on_shutdown_ = true;
+
  private:
   void PointCloudDataPollThread();
   void ImuDataPollThread();
