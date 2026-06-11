@@ -536,27 +536,31 @@ void Lddc::PublishImuData(LidarImuDataQueue& imu_data_queue, const uint8_t index
 #ifdef BUILDING_ROS2
 std::shared_ptr<rclcpp::PublisherBase> Lddc::CreatePublisher(uint8_t msg_type,
     std::string &topic_name, uint32_t queue_size) {
+    const rclcpp::QoS qos{rclcpp::KeepLast(queue_size)};
     if (kPointCloud2Msg == msg_type) {
-      DRIVER_INFO(*cur_node_,
+      RCLCPP_INFO(*logger_,
           "%s publish use PointCloud2 format", topic_name.c_str());
-      return cur_node_->create_publisher<PointCloud2>(topic_name, queue_size);
+      return rclcpp::create_publisher<PointCloud2>(
+          node_parameters_, node_topics_, topic_name, qos);
     } else if (kLivoxCustomMsg == msg_type) {
-      DRIVER_INFO(*cur_node_,
+      RCLCPP_INFO(*logger_,
           "%s publish use livox custom format", topic_name.c_str());
-      return cur_node_->create_publisher<CustomMsg>(topic_name, queue_size);
+      return rclcpp::create_publisher<CustomMsg>(
+          node_parameters_, node_topics_, topic_name, qos);
     }
 #if 0
     else if (kPclPxyziMsg == msg_type)  {
-      DRIVER_INFO(*cur_node_,
+      RCLCPP_INFO(*logger_,
           "%s publish use pcl PointXYZI format", topic_name.c_str());
-      return cur_node_->create_publisher<PointCloud>(topic_name, queue_size);
+      return rclcpp::create_publisher<PointCloud>(
+          node_parameters_, node_topics_, topic_name, qos);
     }
 #endif
     else if (kLivoxImuMsg == msg_type)  {
-      DRIVER_INFO(*cur_node_,
+      RCLCPP_INFO(*logger_,
           "%s publish use imu format", topic_name.c_str());
-      return cur_node_->create_publisher<ImuMsg>(topic_name,
-          queue_size);
+      return rclcpp::create_publisher<ImuMsg>(
+          node_parameters_, node_topics_, topic_name, qos);
     } else {
       PublisherPtr null_publisher(nullptr);
       return null_publisher;

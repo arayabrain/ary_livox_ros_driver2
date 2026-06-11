@@ -208,6 +208,9 @@ int LdsLidar::DeInitLdsLidar(void) {
     printf("Livox Lidar SDK Deinit completely!\n");
   }
 
+  // Allow a later re-init (lifecycle cleanup -> configure). Best effort: the
+  // Livox SDK does not guarantee init after uninit within one process.
+  is_initialized_ = false;
   return 0;
 }
 
@@ -215,25 +218,29 @@ void LdsLidar::PrepareExit(void) { DeInitLdsLidar(); }
 
 namespace {
 
-struct SleepAckState {
+struct WorkModeAckState {
   std::mutex mu;
   std::condition_variable cv;
   uint32_t pending = 0;
+  bool all_ok = true;
 };
 
-void SleepAckCallback(livox_status status, uint32_t handle,
-                      LivoxLidarAsyncControlResponse* /*response*/,
-                      void* client_data) {
-  auto* state = static_cast<SleepAckState*>(client_data);
+void WorkModeAckCallback(livox_status status, uint32_t handle,
+                         LivoxLidarAsyncControlResponse* /*response*/,
+                         void* client_data) {
+  auto* state = static_cast<WorkModeAckState*>(client_data);
   if (state == nullptr) return;
   if (status != kLivoxLidarStatusSuccess) {
-    std::cout << "sleep command failed, handle: " << handle
+    std::cout << "work-mode command failed, handle: " << handle
               << ", status: " << status << std::endl;
   } else {
-    std::cout << "sleep acknowledged, handle: " << handle << std::endl;
+    std::cout << "work-mode acknowledged, handle: " << handle << std::endl;
   }
   {
     std::lock_guard<std::mutex> lock(state->mu);
+    if (status != kLivoxLidarStatusSuccess) {
+      state->all_ok = false;
+    }
     if (state->pending > 0) {
       --state->pending;
     }
@@ -243,12 +250,13 @@ void SleepAckCallback(livox_status status, uint32_t handle,
 
 }  // namespace
 
-void LdsLidar::SleepAllLidarsBlocking(std::chrono::milliseconds timeout) {
+bool LdsLidar::SetAllLidarsWorkModeBlocking(LivoxLidarWorkMode mode,
+                                            std::chrono::milliseconds timeout) {
   if (!is_initialized_) {
-    return;
+    return false;
   }
 
-  SleepAckState state;
+  WorkModeAckState state;
   std::vector<uint32_t> handles;
   for (uint8_t i = 0; i < kMaxSourceLidar; ++i) {
     if (lidars_[i].handle != 0 && lidars_[i].lidar_type == kLivoxLidarType) {
@@ -257,21 +265,33 @@ void LdsLidar::SleepAllLidarsBlocking(std::chrono::milliseconds timeout) {
   }
 
   if (handles.empty()) {
-    return;
+    return false;
   }
 
   state.pending = static_cast<uint32_t>(handles.size());
   for (uint32_t handle : handles) {
-    std::cout << "sending sleep command to handle: " << handle << std::endl;
-    SetLivoxLidarWorkMode(handle, kLivoxLidarWakeUp, SleepAckCallback, &state);
+    std::cout << "sending work mode " << static_cast<int>(mode)
+              << " to handle: " << handle << std::endl;
+    SetLivoxLidarWorkMode(handle, mode, WorkModeAckCallback, &state);
   }
 
   std::unique_lock<std::mutex> lock(state.mu);
   if (!state.cv.wait_for(lock, timeout, [&state] { return state.pending == 0; })) {
-    std::cout << "sleep timeout: " << state.pending
+    std::cout << "work-mode timeout: " << state.pending
               << " LiDAR(s) did not acknowledge within "
               << timeout.count() << " ms" << std::endl;
+    return false;
   }
+  return state.all_ok;
+}
+
+void LdsLidar::SleepAllLidarsBlocking(std::chrono::milliseconds timeout) {
+  // kLivoxLidarWakeUp is the MID-360 standby (motor off) mode; see header.
+  SetAllLidarsWorkModeBlocking(kLivoxLidarWakeUp, timeout);
+}
+
+bool LdsLidar::WakeAllLidarsBlocking(std::chrono::milliseconds timeout) {
+  return SetAllLidarsWorkModeBlocking(kLivoxLidarNormal, timeout);
 }
 
 }  // namespace livox_ros

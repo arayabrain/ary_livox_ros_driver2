@@ -281,6 +281,7 @@ else(ROS_EDITION STREQUAL "ROS2")
     src/livox_ros_driver2.cpp
     src/lddc.cpp
     src/driver_node.cpp
+    src/driver_node_lifecycle.cpp
     src/lds.cpp
     src/lds_lidar.cpp
 
@@ -334,6 +335,12 @@ else(ROS_EDITION STREQUAL "ROS2")
   rclcpp_components_register_node(${PROJECT_NAME}
     PLUGIN "livox_ros::DriverNode"
     EXECUTABLE ${PROJECT_NAME}_node
+  )
+
+  # Lifecycle variant: motor on/off via activate/deactivate transitions.
+  rclcpp_components_register_node(${PROJECT_NAME}
+    PLUGIN "livox_ros::DriverNodeLifecycle"
+    EXECUTABLE ${PROJECT_NAME}_lifecycle_node
   )
 
   # CLI tool for setting LiDAR work mode outside the driver lifecycle.

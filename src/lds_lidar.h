@@ -27,6 +27,7 @@
 #ifndef LIVOX_ROS_DRIVER_LDS_LIDAR_H_
 #define LIVOX_ROS_DRIVER_LDS_LIDAR_H_
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -62,6 +63,23 @@ class LdsLidar final : public Lds {
    * is the correct "sleep / motor off" mode on MID-360 — see Livox-SDK2#103.
    */
   void SleepAllLidarsBlocking(std::chrono::milliseconds timeout);
+
+  /**
+   * Send kLivoxLidarNormal (motor on, scanning) to every configured LiDAR and
+   * block until all acknowledge. Returns false when no LiDAR is configured or
+   * the acks do not arrive within `timeout` (e.g. LiDAR unplugged).
+   */
+  bool WakeAllLidarsBlocking(std::chrono::milliseconds timeout);
+
+  /**
+   * Controls what the discovery callback does when a LiDAR connects:
+   * true  -> kLivoxLidarNormal (motor on; default, existing driver behavior)
+   * false -> kLivoxLidarWakeUp (MID-360 standby / motor off). Used by the
+   *          lifecycle driver node so the LiDAR stays asleep until activated.
+   */
+  void SetWakeOnConnect(bool enable) { wake_on_connect_.store(enable); }
+  bool IsWakeOnConnect() const { return wake_on_connect_.load(); }
+
  private:
   LdsLidar(double publish_freq);
   LdsLidar(const LdsLidar &) = delete;
@@ -69,6 +87,9 @@ class LdsLidar final : public Lds {
   LdsLidar &operator=(const LdsLidar &) = delete;
 
   bool ParseSummaryConfig();
+
+  bool SetAllLidarsWorkModeBlocking(LivoxLidarWorkMode mode,
+                                    std::chrono::milliseconds timeout);
 
   bool InitLidars();
   bool InitLivoxLidar();    // for new SDK
@@ -96,6 +117,7 @@ class LdsLidar final : public Lds {
   bool auto_connect_mode_;
   uint32_t whitelist_count_;
   volatile bool is_initialized_;
+  std::atomic<bool> wake_on_connect_{true};
   char broadcast_code_whitelist_[kMaxLidarCount][kBroadcastCodeSize];
 };
 

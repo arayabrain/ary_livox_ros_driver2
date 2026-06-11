@@ -88,7 +88,18 @@ class Lddc final {
 
   uint8_t GetTransferFormat(void) { return transfer_format_; }
   uint8_t IsMultiTopic(void) { return use_multi_topic_; }
+#ifdef BUILDING_ROS1
   void SetRosNode(livox_ros::DriverNode *node) { cur_node_ = node; }
+#elif defined BUILDING_ROS2
+  // Accepts any node type with topics interface + logger (rclcpp::Node and
+  // rclcpp_lifecycle::LifecycleNode), so the lifecycle driver can reuse Lddc.
+  template <typename NodeT>
+  void SetRosNode(NodeT *node) {
+    node_parameters_ = node->get_node_parameters_interface();
+    node_topics_ = node->get_node_topics_interface();
+    logger_ = std::make_shared<rclcpp::Logger>(node->get_logger());
+  }
+#endif
 
   // void SetRosPub(ros::Publisher *pub) { global_pub_ = pub; };  // NOT USED
   void SetPublishFrq(uint32_t frq) { publish_frq_ = frq; }
@@ -158,7 +169,13 @@ class Lddc final {
   PublisherPtr global_imu_pub_;
 #endif
 
+#ifdef BUILDING_ROS1
   livox_ros::DriverNode *cur_node_;
+#elif defined BUILDING_ROS2
+  rclcpp::node_interfaces::NodeParametersInterface::SharedPtr node_parameters_;
+  rclcpp::node_interfaces::NodeTopicsInterface::SharedPtr node_topics_;
+  std::shared_ptr<rclcpp::Logger> logger_;
+#endif
 };
 
 }  // namespace livox_ros
