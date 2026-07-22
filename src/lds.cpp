@@ -75,6 +75,13 @@ void Lds::ResetLds(uint8_t data_src) {
 
 void Lds::RequestExit() {
   request_exit_ = true;
+  // Wake the poll threads: they block indefinitely in Semaphore::Wait() and
+  // only observe request_exit_ afterwards. Without this the driver can only
+  // exit while data is still flowing — with the sensors already in standby
+  // (lifecycle teardown, sleep_on_shutdown) the join() in the node destructor
+  // deadlocks and the process needs SIGKILL.
+  pcd_semaphore_.Signal();
+  imu_semaphore_.Signal();
 }
 
 bool Lds::IsAllQueueEmpty() {
