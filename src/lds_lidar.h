@@ -31,6 +31,8 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "lds.h"
@@ -71,14 +73,57 @@ class LdsLidar final : public Lds {
    */
   bool WakeAllLidarsBlocking(std::chrono::milliseconds timeout);
 
+  /** Per-sensor outcome of SetLidarsWorkModeBlocking. */
+  struct SensorModeResult {
+    std::string name;
+    bool ok = false;
+    std::string detail;  // "" on success
+  };
+
   /**
-   * Controls what the discovery callback does when a LiDAR connects:
-   * true  -> kLivoxLidarNormal (motor on; default, existing driver behavior)
-   * false -> kLivoxLidarWakeUp (MID-360 standby / motor off). Used by the
-   *          lifecycle driver node so the LiDAR stays asleep until activated.
+   * Send `mode` to the sensors named in `names` (JSON config "name" fields;
+   * empty = every configured sensor) and block until each acknowledges or
+   * `timeout` elapses. Records the requested mode as the per-handle desired
+   * mode BEFORE sending, so a sensor that reconnects later (power blip) is
+   * restored to what the caller last asked for. Per-sensor outcomes land in
+   * `results` (nullable); returns true iff every resolved sensor succeeded.
+   * Unknown names and disconnected sensors fail immediately without waiting.
    */
-  void SetWakeOnConnect(bool enable) { wake_on_connect_.store(enable); }
-  bool IsWakeOnConnect() const { return wake_on_connect_.load(); }
+  bool SetLidarsWorkModeBlocking(const std::vector<std::string>& names,
+                                 LivoxLidarWorkMode mode,
+                                 std::chrono::milliseconds timeout,
+                                 std::vector<SensorModeResult>* results = nullptr);
+
+  /** Configured sensor names, in config order (valid after InitLdsLidar). */
+  std::vector<std::string> GetConfiguredSensorNames() const;
+
+  /**
+   * Work mode the discovery callback applies when a LiDAR (re)connects:
+   * the handle's recorded desired mode if one was set (via
+   * SetLidarsWorkModeBlocking), else the default-on-connect mode.
+   */
+  LivoxLidarWorkMode DesiredModeOnConnect(uint32_t handle) const;
+
+  /**
+   * Sets the default connect-time mode AND resets every per-handle desired
+   * mode to it (a lifecycle transition is a global statement of intent):
+   * kLivoxLidarNormal -> motor on when a sensor connects (plain driver
+   * behavior); kLivoxLidarWakeUp -> standby until asked otherwise (lifecycle
+   * driver while not ACTIVE).
+   */
+  void SetDefaultModeOnConnect(LivoxLidarWorkMode mode);
+
+  /**
+   * Compatibility shim for the plain DriverNode / livox_set_mode tool and the
+   * existing lifecycle transitions: maps true/false onto
+   * SetDefaultModeOnConnect(kLivoxLidarNormal / kLivoxLidarWakeUp).
+   */
+  void SetWakeOnConnect(bool enable) {
+    SetDefaultModeOnConnect(enable ? kLivoxLidarNormal : kLivoxLidarWakeUp);
+  }
+  bool IsWakeOnConnect() const {
+    return default_mode_on_connect_.load() == kLivoxLidarNormal;
+  }
 
  private:
   LdsLidar(double publish_freq);
@@ -88,8 +133,12 @@ class LdsLidar final : public Lds {
 
   bool ParseSummaryConfig();
 
-  bool SetAllLidarsWorkModeBlocking(LivoxLidarWorkMode mode,
-                                    std::chrono::milliseconds timeout);
+  /** Resolve config names to (name, handle) pairs; unresolved names get an
+   *  immediate failed SensorModeResult appended to `failed`. Empty `names`
+   *  resolves to every configured sensor. */
+  std::vector<std::pair<std::string, uint32_t>> ResolveSensorNames(
+      const std::vector<std::string>& names,
+      std::vector<SensorModeResult>* failed) const;
 
   bool InitLidars();
   bool InitLivoxLidar();    // for new SDK
@@ -117,7 +166,11 @@ class LdsLidar final : public Lds {
   bool auto_connect_mode_;
   uint32_t whitelist_count_;
   volatile bool is_initialized_;
-  std::atomic<bool> wake_on_connect_{true};
+  // Connect-time work-mode policy: per-handle overrides (last explicit
+  // request via SetLidarsWorkModeBlocking) on top of a global default.
+  std::atomic<LivoxLidarWorkMode> default_mode_on_connect_{kLivoxLidarNormal};
+  mutable std::mutex desired_mode_mutex_;
+  std::unordered_map<uint32_t, LivoxLidarWorkMode> desired_mode_;
   char broadcast_code_whitelist_[kMaxLidarCount][kBroadcastCodeSize];
 };
 

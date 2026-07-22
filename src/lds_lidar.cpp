@@ -26,11 +26,14 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 
 #ifdef WIN32
 #include <winsock2.h>
@@ -218,11 +221,17 @@ void LdsLidar::PrepareExit(void) { DeInitLdsLidar(); }
 
 namespace {
 
+// Per-handle ack collection for SetLidarsWorkModeBlocking. Heap-allocated and
+// reference-counted by hand: when the blocking caller gives up (timeout) it
+// marks the state `abandoned`; the last late ack callback then frees it. This
+// avoids the use-after-free a stack-allocated state would have when an ack
+// arrives after the caller returned (expected with unplugged sensors).
 struct WorkModeAckState {
   std::mutex mu;
   std::condition_variable cv;
-  uint32_t pending = 0;
-  bool all_ok = true;
+  std::unordered_map<uint32_t, livox_status> done;  // handle -> ack status
+  uint32_t outstanding = 0;  // commands sent, ack still pending
+  bool abandoned = false;    // caller returned; last callback deletes
 };
 
 void WorkModeAckCallback(livox_status status, uint32_t handle,
@@ -236,62 +245,199 @@ void WorkModeAckCallback(livox_status status, uint32_t handle,
   } else {
     std::cout << "work-mode acknowledged, handle: " << handle << std::endl;
   }
+  bool destroy = false;
   {
     std::lock_guard<std::mutex> lock(state->mu);
-    if (status != kLivoxLidarStatusSuccess) {
-      state->all_ok = false;
+    state->done[handle] = status;
+    if (state->outstanding > 0) {
+      --state->outstanding;
     }
-    if (state->pending > 0) {
-      --state->pending;
-    }
+    destroy = state->abandoned && state->outstanding == 0;
+    // Notify while holding the lock: the waiting caller cannot resume (and
+    // possibly delete the state) until this callback releases the mutex.
+    state->cv.notify_all();
   }
-  state->cv.notify_all();
+  if (destroy) {
+    delete state;
+  }
 }
 
 }  // namespace
 
-bool LdsLidar::SetAllLidarsWorkModeBlocking(LivoxLidarWorkMode mode,
-                                            std::chrono::milliseconds timeout) {
+std::vector<std::string> LdsLidar::GetConfiguredSensorNames() const {
+  std::vector<std::string> names;
+  for (uint8_t i = 0; i < kMaxSourceLidar; ++i) {
+    if (lidars_[i].handle != 0 && lidars_[i].lidar_type == kLivoxLidarType) {
+      names.push_back(lidars_[i].livox_config.topic_name);
+    }
+  }
+  return names;
+}
+
+std::vector<std::pair<std::string, uint32_t>> LdsLidar::ResolveSensorNames(
+    const std::vector<std::string>& names,
+    std::vector<SensorModeResult>* failed) const {
+  std::vector<std::pair<std::string, uint32_t>> resolved;
+  if (names.empty()) {
+    for (uint8_t i = 0; i < kMaxSourceLidar; ++i) {
+      if (lidars_[i].handle != 0 && lidars_[i].lidar_type == kLivoxLidarType) {
+        resolved.emplace_back(lidars_[i].livox_config.topic_name,
+                              lidars_[i].handle);
+      }
+    }
+    return resolved;
+  }
+  for (const auto& name : names) {
+    uint32_t handle = 0;
+    for (uint8_t i = 0; i < kMaxSourceLidar; ++i) {
+      if (lidars_[i].handle != 0 && lidars_[i].lidar_type == kLivoxLidarType &&
+          lidars_[i].livox_config.topic_name == name) {
+        handle = lidars_[i].handle;
+        break;
+      }
+    }
+    if (handle != 0) {
+      resolved.emplace_back(name, handle);
+    } else if (failed != nullptr) {
+      failed->push_back({name, false, "unknown sensor"});
+    }
+  }
+  return resolved;
+}
+
+LivoxLidarWorkMode LdsLidar::DesiredModeOnConnect(uint32_t handle) const {
+  std::lock_guard<std::mutex> lock(desired_mode_mutex_);
+  auto it = desired_mode_.find(handle);
+  if (it != desired_mode_.end()) {
+    return it->second;
+  }
+  return default_mode_on_connect_.load();
+}
+
+void LdsLidar::SetDefaultModeOnConnect(LivoxLidarWorkMode mode) {
+  default_mode_on_connect_.store(mode);
+  std::lock_guard<std::mutex> lock(desired_mode_mutex_);
+  desired_mode_.clear();
+}
+
+bool LdsLidar::SetLidarsWorkModeBlocking(
+    const std::vector<std::string>& names, LivoxLidarWorkMode mode,
+    std::chrono::milliseconds timeout,
+    std::vector<SensorModeResult>* results) {
+  std::vector<SensorModeResult> local;
+  std::vector<SensorModeResult>& out = results ? *results : local;
+
   if (!is_initialized_) {
+    for (const auto& name : names) {
+      out.push_back({name, false, "driver not initialized"});
+    }
     return false;
   }
 
-  WorkModeAckState state;
-  std::vector<uint32_t> handles;
-  for (uint8_t i = 0; i < kMaxSourceLidar; ++i) {
-    if (lidars_[i].handle != 0 && lidars_[i].lidar_type == kLivoxLidarType) {
-      handles.push_back(lidars_[i].handle);
+  auto resolved = ResolveSensorNames(names, &out);
+  if (resolved.empty() && out.empty()) {
+    // names was empty and nothing is configured
+    return false;
+  }
+
+  // Record intent before sending: a sensor that (re)connects from now on is
+  // put into `mode` by the discovery callback (see LidarInfoChangeCallback).
+  {
+    std::lock_guard<std::mutex> lock(desired_mode_mutex_);
+    for (const auto& entry : resolved) {
+      desired_mode_[entry.second] = mode;
     }
   }
 
-  if (handles.empty()) {
-    return false;
+  // Send to connected sensors; sensors still discovering get the command as
+  // soon as connect_state leaves kConnectStateOff (polled until the deadline,
+  // which absorbs the configure->activate race right after SDK init).
+  auto* state = new WorkModeAckState();
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::unordered_map<uint32_t, bool> sent;  // handle -> command dispatched
+
+  auto connect_state_of = [this](uint32_t handle) -> LidarConnectState {
+    for (uint8_t i = 0; i < kMaxSourceLidar; ++i) {
+      if (lidars_[i].handle == handle &&
+          lidars_[i].lidar_type == kLivoxLidarType) {
+        return lidars_[i].connect_state;
+      }
+    }
+    return kConnectStateOff;
+  };
+
+  while (true) {
+    for (const auto& entry : resolved) {
+      const uint32_t handle = entry.second;
+      if (!sent[handle] && connect_state_of(handle) != kConnectStateOff) {
+        std::cout << "sending work mode " << static_cast<int>(mode)
+                  << " to sensor '" << entry.first << "' (handle: " << handle
+                  << ")" << std::endl;
+        sent[handle] = true;
+        {
+          std::lock_guard<std::mutex> lock(state->mu);
+          ++state->outstanding;
+        }
+        SetLivoxLidarWorkMode(handle, mode, WorkModeAckCallback, state);
+      }
+    }
+
+    bool all_acked;
+    {
+      std::unique_lock<std::mutex> lock(state->mu);
+      state->cv.wait_until(lock, std::min(deadline,
+                                          std::chrono::steady_clock::now() +
+                                              std::chrono::milliseconds(50)));
+      all_acked = true;
+      for (const auto& entry : resolved) {
+        if (state->done.find(entry.second) == state->done.end()) {
+          all_acked = false;
+          break;
+        }
+      }
+    }
+    if (all_acked || std::chrono::steady_clock::now() >= deadline) {
+      break;
+    }
   }
 
-  state.pending = static_cast<uint32_t>(handles.size());
-  for (uint32_t handle : handles) {
-    std::cout << "sending work mode " << static_cast<int>(mode)
-              << " to handle: " << handle << std::endl;
-    SetLivoxLidarWorkMode(handle, mode, WorkModeAckCallback, &state);
+  bool all_ok = out.empty();  // unknown-name failures already recorded
+  bool destroy;
+  {
+    std::lock_guard<std::mutex> lock(state->mu);
+    for (const auto& entry : resolved) {
+      SensorModeResult r{entry.first, false, ""};
+      auto it = state->done.find(entry.second);
+      if (it == state->done.end()) {
+        r.detail = sent[entry.second] ? "ack timeout" : "not connected";
+      } else if (it->second != kLivoxLidarStatusSuccess) {
+        r.detail = "command failed";
+      } else {
+        r.ok = true;
+      }
+      if (!r.ok) {
+        all_ok = false;
+        std::cout << "work-mode result for '" << r.name << "': " << r.detail
+                  << std::endl;
+      }
+      out.push_back(std::move(r));
+    }
+    state->abandoned = true;
+    destroy = state->outstanding == 0;
   }
-
-  std::unique_lock<std::mutex> lock(state.mu);
-  if (!state.cv.wait_for(lock, timeout, [&state] { return state.pending == 0; })) {
-    std::cout << "work-mode timeout: " << state.pending
-              << " LiDAR(s) did not acknowledge within "
-              << timeout.count() << " ms" << std::endl;
-    return false;
+  if (destroy) {
+    delete state;
   }
-  return state.all_ok;
+  return all_ok;
 }
 
 void LdsLidar::SleepAllLidarsBlocking(std::chrono::milliseconds timeout) {
   // kLivoxLidarWakeUp is the MID-360 standby (motor off) mode; see header.
-  SetAllLidarsWorkModeBlocking(kLivoxLidarWakeUp, timeout);
+  SetLidarsWorkModeBlocking({}, kLivoxLidarWakeUp, timeout);
 }
 
 bool LdsLidar::WakeAllLidarsBlocking(std::chrono::milliseconds timeout) {
-  return SetAllLidarsWorkModeBlocking(kLivoxLidarNormal, timeout);
+  return SetLidarsWorkModeBlocking({}, kLivoxLidarNormal, timeout);
 }
 
 }  // namespace livox_ros

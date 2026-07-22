@@ -103,15 +103,21 @@ void LivoxLidarCallback::LidarInfoChangeCallback(const uint32_t handle,
                                  LivoxLidarCallback::SetAttitudeCallback, lds_lidar);
   }
 
-  if (lds_lidar->IsWakeOnConnect()) {
+  // Apply the desired work mode for this handle: the last explicitly
+  // requested per-sensor mode (SetLidarsWorkModeBlocking), else the node's
+  // default-on-connect mode. This restores the caller's intent after a
+  // power-blip reconnect and keeps sensors asleep while the lifecycle driver
+  // is not ACTIVE (even if a previous session left them spinning).
+  const LivoxLidarWorkMode desired = lds_lidar->DesiredModeOnConnect(handle);
+  if (desired == kLivoxLidarNormal) {
     std::cout << "begin to change work mode to 'Normal', handle: " << handle << std::endl;
     SetLivoxLidarWorkMode(handle, kLivoxLidarNormal, WorkModeChangedCallback, nullptr);
   } else {
-    // Lifecycle driver not ACTIVE: force standby so the motor stays off even
-    // if the LiDAR was left spinning by a previous session. Fire-and-forget —
-    // WorkModeChangedCallback must not be used here (it retries 'Normal').
-    std::cout << "wake-on-connect disabled; sending standby, handle: " << handle << std::endl;
-    SetLivoxLidarWorkMode(handle, kLivoxLidarWakeUp, nullptr, nullptr);
+    // Fire-and-forget — WorkModeChangedCallback must not be used here
+    // (it retries 'Normal').
+    std::cout << "sending standby (desired mode " << static_cast<int>(desired)
+              << "), handle: " << handle << std::endl;
+    SetLivoxLidarWorkMode(handle, desired, nullptr, nullptr);
   }
   EnableLivoxLidarImuData(handle, LivoxLidarCallback::EnableLivoxLidarImuDataCallback, lds_lidar);
   return;

@@ -26,7 +26,13 @@
 
 #ifdef BUILDING_ROS2
 
+#include <algorithm>
 #include <chrono>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <lifecycle_msgs/msg/state.hpp>
 
 #include "include/livox_ros_driver2.h"
 #include "lddc.h"
@@ -52,6 +58,12 @@ DriverNodeLifecycle::DriverNodeLifecycle(const rclcpp::NodeOptions& options)
   this->declare_parameter("lvx_file_path", "/home/livox/livox_test.lvx");
   this->declare_parameter("sleep_on_shutdown", true);
   this->declare_parameter("activate_timeout_ms", 5000);
+  // Sensors (JSON config "name" fields) that on_activate wakes and that
+  // ~/set_sensor_mode refuses to put in standby. All other configured sensors
+  // stay in standby until woken through the service.
+  this->declare_parameter("always_on_sensors",
+                          std::vector<std::string>{"center"});
+  this->declare_parameter("mode_switch_timeout_ms", 2000);
 }
 
 DriverNodeLifecycle::~DriverNodeLifecycle() { TeardownDriver(); }
@@ -110,6 +122,37 @@ DriverNodeLifecycle::CallbackReturn DriverNodeLifecycle::on_configure(
   }
   DRIVER_INFO(*this, "Init lds lidar success!");
 
+  // Validate the always-on set against the configured sensor names; unknown
+  // entries are dropped (with a warning) so a typo cannot make on_activate
+  // wait on a sensor that does not exist.
+  this->get_parameter("always_on_sensors", always_on_sensors_);
+  this->get_parameter("mode_switch_timeout_ms", mode_switch_timeout_ms_);
+  const auto configured = lds_lidar_->GetConfiguredSensorNames();
+  std::vector<std::string> valid;
+  for (const auto& name : always_on_sensors_) {
+    if (std::find(configured.begin(), configured.end(), name) !=
+        configured.end()) {
+      valid.push_back(name);
+    } else {
+      DRIVER_WARN(*this,
+                  "always_on_sensors entry '%s' is not in the LiDAR config - "
+                  "ignoring it",
+                  name.c_str());
+    }
+  }
+  always_on_sensors_ = valid;
+  if (always_on_sensors_.empty()) {
+    DRIVER_WARN(*this,
+                "always_on_sensors is empty: on_activate will not wake any "
+                "sensor; use ~/set_sensor_mode to wake sensors on demand.");
+  }
+
+  set_sensor_mode_srv_ =
+      this->create_service<livox_ros_driver2::srv::SetSensorMode>(
+          "~/set_sensor_mode",
+          std::bind(&DriverNodeLifecycle::HandleSetSensorMode, this,
+                    std::placeholders::_1, std::placeholders::_2));
+
   // The poll threads just block on the data semaphore while the motor is off,
   // so it is safe (and simplest) to run them from configure onwards.
   pointclouddata_poll_thread_ = std::make_shared<std::thread>(
@@ -127,25 +170,47 @@ DriverNodeLifecycle::CallbackReturn DriverNodeLifecycle::on_activate(
   if (lds_lidar_ == nullptr) {
     return CallbackReturn::FAILURE;
   }
-  // From now on a LiDAR that (re)connects is woken automatically.
-  lds_lidar_->SetWakeOnConnect(true);
-  if (!lds_lidar_->WakeAllLidarsBlocking(
-          std::chrono::milliseconds(activate_timeout_ms_))) {
+  if (always_on_sensors_.empty()) {
+    DRIVER_WARN(*this,
+                "Activated with an empty always-on set: every sensor stays in "
+                "STANDBY until woken via ~/set_sensor_mode.");
+    return CallbackReturn::SUCCESS;
+  }
+  // Wake only the always-on set; the wake is recorded as each handle's
+  // desired mode, so a sensor that reconnects (power blip) wakes again while
+  // every other sensor keeps standby as its connect-time mode.
+  std::vector<LdsLidar::SensorModeResult> results;
+  if (!lds_lidar_->SetLidarsWorkModeBlocking(
+          always_on_sensors_, kLivoxLidarNormal,
+          std::chrono::milliseconds(activate_timeout_ms_), &results)) {
+    for (const auto& r : results) {
+      if (!r.ok) {
+        DRIVER_ERROR(*this, "always-on sensor '%s' failed to wake: %s",
+                     r.name.c_str(), r.detail.c_str());
+      }
+    }
     DRIVER_ERROR(*this,
-                 "Failed to wake LiDAR(s) within %d ms - is the LiDAR "
-                 "connected and powered?",
+                 "Failed to wake always-on LiDAR(s) within %d ms - is the "
+                 "LiDAR connected and powered?",
                  activate_timeout_ms_);
-    lds_lidar_->SetWakeOnConnect(false);
+    // Roll back: clear the wake intent and best-effort sleep anything woken.
+    lds_lidar_->SetDefaultModeOnConnect(kLivoxLidarWakeUp);
+    lds_lidar_->SetLidarsWorkModeBlocking(always_on_sensors_,
+                                          kLivoxLidarWakeUp,
+                                          std::chrono::milliseconds(2000));
     return CallbackReturn::FAILURE;  // rolls back to 'inactive'
   }
-  DRIVER_INFO(*this, "Activated. LiDAR is SCANNING (motor on).");
+  DRIVER_INFO(*this,
+              "Activated. Always-on sensor(s) SCANNING (motor on); remaining "
+              "sensors in STANDBY - wake them via ~/set_sensor_mode.");
   return CallbackReturn::SUCCESS;
 }
 
 DriverNodeLifecycle::CallbackReturn DriverNodeLifecycle::on_deactivate(
     const rclcpp_lifecycle::State& /*state*/) {
   if (lds_lidar_ != nullptr) {
-    lds_lidar_->SetWakeOnConnect(false);
+    // Reset every per-sensor wake intent, then best-effort sleep everything.
+    lds_lidar_->SetDefaultModeOnConnect(kLivoxLidarWakeUp);
     lds_lidar_->SleepAllLidarsBlocking(std::chrono::milliseconds(2000));
   }
   DRIVER_INFO(*this, "Deactivated. LiDAR is in STANDBY (motor off).");
@@ -164,11 +229,88 @@ DriverNodeLifecycle::CallbackReturn DriverNodeLifecycle::on_shutdown(
   return CallbackReturn::SUCCESS;
 }
 
+void DriverNodeLifecycle::HandleSetSensorMode(
+    const std::shared_ptr<livox_ros_driver2::srv::SetSensorMode::Request> req,
+    std::shared_ptr<livox_ros_driver2::srv::SetSensorMode::Response> res) {
+  auto refuse_all = [&](const std::string& why) {
+    res->success = false;
+    res->message = why;
+    for (const auto& name : req->sensors) {
+      res->sensors.push_back(name);
+      res->ok.push_back(false);
+      res->detail.push_back(why);
+    }
+  };
+
+  if (lds_lidar_ == nullptr) {
+    refuse_all("driver not configured");
+    return;
+  }
+
+  // Normalize: empty or ["all"] means every configured sensor.
+  std::vector<std::string> names = req->sensors;
+  if (names.size() == 1 && names.front() == "all") {
+    names.clear();
+  }
+  if (names.empty()) {
+    names = lds_lidar_->GetConfiguredSensorNames();
+  }
+
+  const bool node_active =
+      this->get_current_state().id() ==
+      lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+  if (req->active && !node_active) {
+    refuse_all("node is not ACTIVE; wake refused");
+    return;
+  }
+
+  // Standby requests must not silence the always-on set (the LIO feed):
+  // record a per-sensor refusal and process the rest.
+  std::vector<LdsLidar::SensorModeResult> results;
+  std::vector<std::string> to_send;
+  for (const auto& name : names) {
+    if (!req->active &&
+        std::find(always_on_sensors_.begin(), always_on_sensors_.end(),
+                  name) != always_on_sensors_.end()) {
+      results.push_back(
+          {name, false, "always-on sensor; deactivate the node instead"});
+    } else {
+      to_send.push_back(name);
+    }
+  }
+
+  const auto timeout = std::chrono::milliseconds(
+      req->timeout_ms > 0 ? static_cast<int>(req->timeout_ms)
+                          : mode_switch_timeout_ms_);
+  if (!to_send.empty()) {
+    lds_lidar_->SetLidarsWorkModeBlocking(
+        to_send, req->active ? kLivoxLidarNormal : kLivoxLidarWakeUp, timeout,
+        &results);
+  }
+
+  size_t ok_count = 0;
+  for (const auto& r : results) {
+    res->sensors.push_back(r.name);
+    res->ok.push_back(r.ok);
+    res->detail.push_back(r.detail);
+    if (r.ok) {
+      ++ok_count;
+    }
+  }
+  res->success = ok_count == results.size() && !results.empty();
+  std::ostringstream msg;
+  msg << ok_count << "/" << results.size() << " ok ("
+      << (req->active ? "wake" : "standby") << ")";
+  res->message = msg.str();
+  DRIVER_INFO(*this, "set_sensor_mode: %s", res->message.c_str());
+}
+
 void DriverNodeLifecycle::TeardownDriver() {
   if (!driver_running_) {
     return;
   }
   driver_running_ = false;
+  set_sensor_mode_srv_.reset();
 
   // Same sequence as DriverNode::~DriverNode (driver_node.cpp).
   if (sleep_on_shutdown_ && lddc_ptr_ && lddc_ptr_->lds_) {

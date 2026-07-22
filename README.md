@@ -526,6 +526,46 @@ For more infomation about the HAP config, please refer to:
 
 ```
 
+## 4.1 Lifecycle node & per-sensor power control (fork addition)
+
+Besides the plain `livox_ros_driver2_node`, this fork ships
+`livox_ros_driver2_lifecycle_node` (`livox_ros::DriverNodeLifecycle`), which
+manages the motor state of the configured sensors at runtime:
+
+* `configure` — SDK init + discovery; every sensor is held in STANDBY
+  (motor off). `kLivoxLidarWakeUp` is the Mid-360 standby mode despite the
+  enum name (Livox-SDK2#103).
+* `activate` — wakes only the sensors listed in the `always_on_sensors`
+  parameter (default `["center"]`); fails (rolls back to inactive) if any of
+  them does not acknowledge within `activate_timeout_ms`.
+* `deactivate` — puts every sensor back in STANDBY.
+
+While the node is ACTIVE, the remaining sensors are woken/slept on demand via
+the `~/set_sensor_mode` service (`livox_ros_driver2/srv/SetSensorMode`):
+
+```shell
+# wake the digging set
+ros2 service call /livox_lidar_publisher/set_sensor_mode \
+  livox_ros_driver2/srv/SetSensorMode "{sensors: [front, back, left, right], active: true}"
+
+# put them back in standby ('all' also works; always-on sensors are skipped)
+ros2 service call /livox_lidar_publisher/set_sensor_mode \
+  livox_ros_driver2/srv/SetSensorMode "{sensors: [all], active: false}"
+```
+
+The response reports a per-sensor `ok`/`detail` pair. Wake requests are
+refused unless the node is ACTIVE; standby requests for `always_on_sensors`
+are refused (deactivate the node instead). The last requested mode per sensor
+is also re-applied when a sensor reconnects after a power blip.
+
+**Why one node for all sensors instead of one process per sensor group:** the
+`host_net_info` blocks in the multi-sensor JSON configs share host UDP ports
+per LiDAR type (both HAPs on 57000/58000/56000, all Mid-360s on 561xx), so a
+second driver process on the same host IP fails to bind (`EADDRINUSE`) unless
+the port map is split by hand — and it would also duplicate SDK discovery
+traffic and split time-sync handling. Per-sensor work-mode commands inside a
+single process avoid all of that.
+
 ## 5. Supported LiDAR list
 
 * HAP

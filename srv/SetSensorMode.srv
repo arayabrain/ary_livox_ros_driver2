@@ -1,0 +1,15 @@
+# Wake / sleep individual Livox sensors by their JSON config "name"
+# (e.g. "center", "front"). Served by DriverNodeLifecycle as ~/set_sensor_mode.
+#
+# NOTE: "standby" is kLivoxLidarWakeUp — despite the enum name it is the
+# motor-off low-power mode (see Livox-SDK2#103).
+string[] sensors        # config names; empty or ["all"] = every configured sensor
+bool active             # true -> kLivoxLidarNormal (motor on), false -> standby
+uint32 timeout_ms 0     # per-request ack timeout; 0 = node param mode_switch_timeout_ms
+---
+bool success            # true iff every resolved sensor acknowledged
+string[] sensors        # resolved sensor names, aligned with ok/detail
+bool[] ok               # per-sensor result
+string[] detail         # "" on success; e.g. "unknown sensor", "not connected",
+                        # "ack timeout", "command failed", "always-on sensor"
+string message          # human-readable summary, e.g. "2/2 ok"
